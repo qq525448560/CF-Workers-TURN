@@ -1,6 +1,6 @@
 import { connect } from 'cloudflare:sockets';
 
-const uuid = '2523c510-9ff0-415b-9582-93949bfae7e3';
+const uuid = 'e258977b-e413-4718-a3af-02d75492c349';
 const maxED = 8192;
 
 export default {
