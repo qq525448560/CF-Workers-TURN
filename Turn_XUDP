@@ -1,0 +1,368 @@
+import { connect } from 'cloudflare:sockets';
+
+const uuid = '2523c510-9ff0-415b-9582-93949bfae7e3';
+const maxED = 8192;
+
+export default {
+  fetch: req =>
+    req.headers.get('Upgrade') === 'websocket'
+      ? ws(req)
+      : new Response('ok')
+};
+
+const dec = new TextDecoder();
+const enc = s => new TextEncoder().encode(s);
+
+const hexToBytes = hex =>
+  Uint8Array.from(
+    hex.match(/.{1,2}/g).map(b => parseInt(b, 16))
+  );
+
+const b64ToBytes = b64 => {
+  b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  const bin = atob(b64);
+  return Uint8Array.from(bin, c => c.charCodeAt(0));
+};
+
+const idB = hexToBytes(uuid.replaceAll('-', ''));
+
+const u16 = (b, o = 0) => (b[o] << 8) | b[o + 1];
+const pad4 = n => -n & 3;
+
+const checkUUID = c =>
+  c &&
+  c.length >= 17 &&
+  !idB.some((v, i) => c[i + 1] !== v);
+
+const addr = (t, b) =>
+  t === 3
+    ? dec.decode(b)
+    : t === 1
+      ? b.join('.')
+      : t === 4
+        ? `[${Array.from(
+            { length: 8 },
+            (_, i) => u16(b, i * 2).toString(16)
+          ).join(':')}]`
+        : '';
+
+const parseAddr = (b, o, t) => {
+  const l =
+    t === 3 ? b[o++] :
+    t === 1 ? 4 :
+    t === 4 ? 16 : 0;
+
+  return l && o + l <= b.length
+    ? {
+        addrBytes: b.subarray(o, o + l),
+        dataOffset: o + l
+      }
+    : null;
+};
+
+const vless = c => {
+  if (!checkUUID(c)) return null;
+
+  const o = 19 + c[17];
+  const t = c[o + 2] === 1 ? 1 : c[o + 2] + 1;
+  const a = parseAddr(c, o + 3, t);
+
+  return a
+    ? {
+        addrType: t,
+        ...a,
+        port: u16(c, o)
+      }
+    : null;
+};
+
+const relay = async (rd, send, close) => {
+  try {
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      value?.byteLength && send(value);
+    }
+  } catch {}
+
+  finally {
+    rd.releaseLock();
+    close();
+  }
+};
+
+const safeClose = (...a) =>
+  a.forEach(x => {
+    try {
+      x?.close?.();
+    } catch {}
+  });
+
+const dial = async (h, p) => {
+  console.log('CONNECT:', h, p);
+
+  const s = connect({
+    hostname: h,
+    port: p
+  });
+
+  await s.opened;
+
+  console.log('CONNECTED:', h, p);
+
+  return s;
+};
+
+const resolveIP = async h =>
+  /^\d+\.\d+\.\d+\.\d+$/.test(h)
+    ? h
+    : (
+        await fetch(
+          `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(h)}&type=A`,
+          {
+            headers: {
+              Accept: 'application/dns-json'
+            }
+          }
+        )
+          .then(r => r.json())
+          .catch(() => ({}))
+      ).Answer?.find(a => a.type === 1)?.data ?? null;
+
+const getTurn = url => {
+  const m = decodeURIComponent(url).match(
+    /\/turn:\/\/([^?&#\s]*)/i
+  );
+
+  if (!m) return null;
+
+  const t = m[1];
+  const at = t.lastIndexOf('@');
+
+  const cred = at >= 0 ? t.slice(0, at) : '';
+  const hp = t.slice(at + 1);
+
+  const [host, p] = hp.split(':');
+
+  const ci = cred.indexOf(':');
+
+  return p
+    ? {
+        host,
+        port: +p,
+        user: ci >= 0 ? cred.slice(0, ci) : '',
+        pass: ci >= 0 ? cred.slice(ci + 1) : ''
+      }
+    : null;
+};
+
+const ws = async req => {
+  const [client, server] = Object.values(
+    new WebSocketPair()
+  );
+
+  server.accept();
+
+  const ed = req.headers.get(
+    'sec-websocket-protocol'
+  );
+
+  const turn = getTurn(req.url);
+
+  let w = null;
+  let sock = null;
+
+  let chain = Promise.resolve();
+
+  const close = () => {
+    safeClose(sock, server);
+  };
+
+  const send = d => {
+    try {
+      server.send(d);
+    } catch {}
+  };
+
+  const process = async chunk => {
+    console.log(
+      'WS DATA:',
+      chunk?.length
+    );
+
+    if (!chunk?.length) {
+      console.log('EMPTY CHUNK');
+      return close();
+    }
+
+    if (w) return w.write(chunk);
+
+    const v = vless(chunk);
+
+    if (!v) {
+      console.log('VLESS PARSE FAILED');
+      return close();
+    }
+
+    send(new Uint8Array([chunk[0], 0]));
+
+    const {
+      addrType,
+      addrBytes,
+      dataOffset,
+      port
+    } = v;
+
+    const host = addr(
+      addrType,
+      addrBytes
+    );
+
+    const payload = chunk.subarray(
+      dataOffset
+    );
+
+    console.log(
+      'TARGET:',
+      host,
+      port
+    );
+
+    if (turn) {
+      console.log(
+        'TURN MODE:',
+        turn.host,
+        turn.port
+      );
+    }
+
+    try {
+      if (turn) {
+        const ip =
+          addrType === 1
+            ? host
+            : await resolveIP(host);
+
+        if (!ip) {
+          console.log('DNS FAILED');
+          return close();
+        }
+
+        sock = await dial(
+          turn.host,
+          turn.port
+        );
+
+      } else {
+        sock = await dial(
+          host,
+          port
+        );
+      }
+
+    } catch (e) {
+      console.log(
+        'CONNECT ERROR:',
+        e?.message || e
+      );
+
+      return close();
+    }
+
+    w = sock.writable.getWriter();
+
+    if (payload.byteLength) {
+      await w.write(payload);
+    }
+
+    relay(
+      sock.readable.getReader(),
+      send,
+      close
+    );
+  };
+
+  if (ed?.length <= maxED) {
+    chain = chain
+      .then(() =>
+        process(
+          b64ToBytes(ed)
+        )
+      )
+      .catch(close);
+  }
+
+  server.addEventListener(
+    'message',
+    async e => {
+      try {
+        let data;
+
+        if (e.data instanceof ArrayBuffer) {
+          data = new Uint8Array(
+            e.data
+          );
+
+        } else if (e.data instanceof Blob) {
+          data = new Uint8Array(
+            await e.data.arrayBuffer()
+          );
+
+        } else if (
+          ArrayBuffer.isView(e.data)
+        ) {
+          data = new Uint8Array(
+            e.data.buffer,
+            e.data.byteOffset,
+            e.data.byteLength
+          );
+
+        } else if (
+          typeof e.data === 'string'
+        ) {
+          data = enc(e.data);
+
+        } else {
+          console.log(
+            'UNKNOWN WS TYPE'
+          );
+
+          return close();
+        }
+
+        chain = chain
+          .then(() => process(data))
+          .catch(close);
+
+      } catch (e) {
+        console.log(
+          'WS ERROR:',
+          e?.message || e
+        );
+
+        close();
+      }
+    }
+  );
+
+  server.addEventListener(
+    'close',
+    close
+  );
+
+  server.addEventListener(
+    'error',
+    close
+  );
+
+  return new Response(null, {
+    status: 101,
+    webSocket: client,
+    headers: ed
+      ? {
+          'sec-websocket-protocol': ed
+        }
+      : {}
+  });
+};
