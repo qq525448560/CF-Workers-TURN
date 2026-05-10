@@ -3,216 +3,131 @@ import { connect } from 'cloudflare:sockets';
 const uuid = 'e258977b-e413-4718-a3af-02d75492c349';
 const maxED = 8192;
 
+const hexToBytes = hex => {
+  const arr = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < arr.length; i++) {
+    arr[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return arr;
+};
+
+const base64ToBytes = b64 => {
+  b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  const bin = atob(b64);
+  return Uint8Array.from(bin, c => c.charCodeAt(0));
+};
+
 export default {
-  async fetch(req, env, ctx) {
+  async fetch(req) {
+    try {
+      if (req.headers.get('Upgrade') !== 'websocket') {
+        return new Response('ok', { status: 200 });
+      }
 
-    const upgrade = req.headers
-      .get('Upgrade')
-      ?.toLowerCase();
-
-    if (upgrade === 'websocket') {
-      return ws(req, ctx);
+      return await ws(req);
+    } catch (e) {
+      return new Response(String(e), { status: 500 });
     }
-
-    return new Response('ok');
   }
 };
+
+const idB = hexToBytes(uuid.replaceAll('-', ''));
 
 const dec = new TextDecoder();
-const enc = s => new TextEncoder().encode(s);
 
-const hexToBytes = hex =>
-  Uint8Array.from(
-    hex.match(/.{1,2}/g).map(x => parseInt(x, 16))
-  );
+const u16 = (b, o = 0) => (b[o] << 8) | b[o + 1];
 
-const b64ToBytes = b64 => {
+const checkUUID = c => {
+  if (c.length < 17) return false;
 
-  b64 = b64
-    .replace(/-/g, '+')
-    .replace(/_/g, '/');
-
-  while (b64.length % 4) {
-    b64 += '=';
+  for (let i = 0; i < idB.length; i++) {
+    if (c[i + 1] !== idB[i]) return false;
   }
 
-  const bin = atob(b64);
-
-  return Uint8Array.from(
-    bin,
-    c => c.charCodeAt(0)
-  );
+  return true;
 };
-
-const idB = hexToBytes(
-  uuid.replaceAll('-', '')
-);
-
-const u16 = (b, o = 0) =>
-  (b[o] << 8) | b[o + 1];
-
-const checkUUID = c =>
-  c &&
-  c.length >= 17 &&
-  !idB.some(
-    (v, i) => c[i + 1] !== v
-  );
 
 const addr = (t, b) =>
   t === 3
     ? dec.decode(b)
     : t === 1
-      ? b.join('.')
-      : t === 4
-        ? `[${Array.from(
-            { length: 8 },
-            (_, i) =>
-              u16(b, i * 2).toString(16)
-          ).join(':')}]`
-        : '';
+    ? b.join('.')
+    : t === 4
+    ? `[${Array.from({ length: 8 }, (_, i) =>
+        u16(b, i * 2).toString(16)
+      ).join(':')}]`
+    : '';
 
 const parseAddr = (b, o, t) => {
-
   const l =
     t === 3
       ? b[o++]
       : t === 1
-        ? 4
-        : t === 4
-          ? 16
-          : 0;
+      ? 4
+      : t === 4
+      ? 16
+      : 0;
 
   return l && o + l <= b.length
     ? {
-        addrBytes: b.subarray(
-          o,
-          o + l
-        ),
+        addrBytes: b.subarray(o, o + l),
         dataOffset: o + l
       }
     : null;
 };
 
 const vless = c => {
+  if (!checkUUID(c)) return null;
 
-  if (!checkUUID(c)) {
-    return null;
-  }
+  const o = 19 + c[17];
 
-  const opt = c[17];
-  const o = 19 + opt;
+  const t = c[o + 2] === 1 ? 1 : c[o + 2] + 1;
 
-  if (o + 4 >= c.length) {
-    return null;
-  }
-
-  const port = u16(c, o);
-
-  const t =
-    c[o + 2] === 1
-      ? 1
-      : c[o + 2] + 1;
-
-  const a = parseAddr(
-    c,
-    o + 3,
-    t
-  );
+  const a = parseAddr(c, o + 3, t);
 
   return a
     ? {
         addrType: t,
         ...a,
-        port
+        port: u16(c, o)
       }
     : null;
 };
 
-const relay = async (
-  rd,
-  send,
-  close
-) => {
-
+const relay = async (rd, send, close) => {
   try {
-
     for (;;) {
+      const { done, value } = await rd.read();
 
-      const {
-        done,
-        value
-      } = await rd.read();
+      if (done) break;
 
-      if (done) {
-        break;
-      }
-
-      if (value?.byteLength) {
-        send(value);
-      }
+      if (value?.byteLength) send(value);
     }
+  } catch {}
 
-  } catch (e) {
-
-    console.log(
-      'RELAY ERROR:',
-      e?.message || e
-    );
-
-  } finally {
-
-    try {
-      rd.releaseLock();
-    } catch {}
-
-    close();
-  }
+  close();
 };
 
-const safeClose = (...a) => {
-
-  for (const x of a) {
-
-    try {
-      x?.close?.();
-    } catch {}
-  }
-};
-
-const dial = async (
-  host,
-  port
-) => {
-
-  console.log(
-    'CONNECT:',
-    host,
-    port
-  );
-
+const dial = async (h, p) => {
   const s = connect({
-    hostname: host,
-    port
+    hostname: h,
+    port: p
   });
 
   await s.opened;
 
-  console.log(
-    'CONNECTED:',
-    host,
-    port
-  );
-
   return s;
 };
 
-const ws = async (
-  req,
-  ctx
-) => {
+const safeClose = (...a) =>
+  a.forEach(x => {
+    try {
+      x?.close?.();
+    } catch {}
+  });
 
-  console.log('WS START');
-
+const ws = async req => {
   const pair = new WebSocketPair();
 
   const client = pair[0];
@@ -223,281 +138,107 @@ const ws = async (
   let sock = null;
   let writer = null;
 
-  const ed = req.headers.get(
-    'sec-websocket-protocol'
-  );
-
   const close = () => {
-
-    console.log('CLOSE');
-
-    safeClose(
-      sock,
-      server
-    );
+    safeClose(sock, server);
   };
 
   const send = d => {
-
     try {
       server.send(d);
     } catch {}
   };
 
   const process = async chunk => {
+    if (writer) {
+      await writer.write(chunk);
+      return;
+    }
+
+    const v = vless(chunk);
+
+    if (!v) {
+      close();
+      return;
+    }
+
+    send(new Uint8Array([chunk[0], 0]));
+
+    const {
+      addrType,
+      addrBytes,
+      dataOffset,
+      port
+    } = v;
+
+    const host = addr(addrType, addrBytes);
+
+    if (!host) {
+      close();
+      return;
+    }
 
     try {
-
-      console.log(
-        'WS DATA:',
-        chunk?.length
-      );
-
-      if (
-        !chunk ||
-        !chunk.length
-      ) {
-
-        console.log(
-          'EMPTY DATA'
-        );
-
-        return close();
-      }
-
-      if (writer) {
-        return writer.write(chunk);
-      }
-
-      const v = vless(chunk);
-
-      if (!v) {
-
-        console.log(
-          'VLESS PARSE FAILED'
-        );
-
-        return close();
-      }
-
-      send(
-        new Uint8Array([
-          chunk[0],
-          0
-        ])
-      );
-
-      const {
-        addrType,
-        addrBytes,
-        dataOffset,
-        port
-      } = v;
-
-      const host = addr(
-        addrType,
-        addrBytes
-      );
-
-      console.log(
-        'TARGET:',
-        host,
-        port
-      );
-
-      const payload =
-        chunk.subarray(
-          dataOffset
-        );
-
-      try {
-
-        sock = await dial(
-          host,
-          port
-        );
-
-      } catch (e) {
-
-        console.log(
-          'CONNECT FAILED:',
-          e?.message || e
-        );
-
-        return close();
-      }
-
-      writer =
-        sock.writable.getWriter();
-
-      if (
-        payload &&
-        payload.byteLength
-      ) {
-
-        await writer.write(
-          payload
-        );
-      }
-
-      relay(
-        sock.readable.getReader(),
-        send,
-        close
-      );
-
-    } catch (e) {
-
-      console.log(
-        'PROCESS ERROR:',
-        e?.message || e
-      );
-
+      sock = await dial(host, port);
+    } catch {
       close();
+      return;
     }
+
+    writer = sock.writable.getWriter();
+
+    const payload = chunk.subarray(dataOffset);
+
+    if (payload.byteLength) {
+      await writer.write(payload);
+    }
+
+    relay(
+      sock.readable.getReader(),
+      send,
+      close
+    );
   };
 
-  if (
-    ed &&
-    ed.length <= maxED
-  ) {
+  try {
+    const ed = req.headers.get('sec-websocket-protocol');
 
-    try {
-
-      console.log(
-        'EARLY DATA'
-      );
-
-      await process(
-        b64ToBytes(ed)
-      );
-
-    } catch (e) {
-
-      console.log(
-        'EARLY DATA ERROR:',
-        e?.message || e
-      );
-    }
-  }
-
-  server.addEventListener(
-    'message',
-    async e => {
-
+    if (ed?.length && ed.length <= maxED) {
       try {
+        await process(base64ToBytes(ed));
+      } catch {}
+    }
 
+    server.addEventListener('message', async e => {
+      try {
         let data;
 
-        if (
-          e.data instanceof ArrayBuffer
-        ) {
-
-          data =
-            new Uint8Array(
-              e.data
-            );
-
-        } else if (
-          e.data instanceof Blob
-        ) {
-
-          data =
-            new Uint8Array(
-              await e.data.arrayBuffer()
-            );
-
-        } else if (
-          ArrayBuffer.isView(
-            e.data
-          )
-        ) {
-
-          data =
-            new Uint8Array(
-              e.data.buffer,
-              e.data.byteOffset,
-              e.data.byteLength
-            );
-
-        } else if (
-          typeof e.data === 'string'
-        ) {
-
-          data = enc(
-            e.data
-          );
-
+        if (e.data instanceof ArrayBuffer) {
+          data = new Uint8Array(e.data);
+        } else if (e.data?.buffer) {
+          data = new Uint8Array(e.data.buffer);
         } else {
-
-          console.log(
-            'UNKNOWN WS TYPE'
-          );
-
-          return close();
+          data = new Uint8Array(await e.data.arrayBuffer());
         }
 
         await process(data);
-
-      } catch (e) {
-
-        console.log(
-          'MESSAGE ERROR:',
-          e?.message || e
-        );
-
+      } catch {
         close();
       }
-    }
-  );
+    });
 
-  server.addEventListener(
-    'close',
-    () => {
+    server.addEventListener('close', close);
 
-      console.log(
-        'WS CLOSED'
-      );
+    server.addEventListener('error', close);
 
-      close();
-    }
-  );
+    return new Response(null, {
+      status: 101,
+      webSocket: client
+    });
+  } catch (e) {
+    close();
 
-  server.addEventListener(
-    'error',
-    e => {
-
-      console.log(
-        'WS ERROR:',
-        e?.message || e
-      );
-
-      close();
-    }
-  );
-
-  ctx.waitUntil(
-    new Promise(resolve => {
-
-      server.addEventListener(
-        'close',
-        resolve
-      );
-
-      server.addEventListener(
-        'error',
-        resolve
-      );
-    })
-  );
-
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-    headers: ed
-      ? {
-          'sec-websocket-protocol': ed
-        }
-      : {}
-  });
+    return new Response(String(e), {
+      status: 500
+    });
+  }
 };
