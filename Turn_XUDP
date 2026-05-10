@@ -5,9 +5,16 @@ const maxED = 8192;
 
 export default {
   async fetch(req, env, ctx) {
-    return req.headers.get('Upgrade') === 'websocket'
-      ? ws(req, ctx)
-      : new Response('ok');
+
+    const upgrade = req.headers
+      .get('Upgrade')
+      ?.toLowerCase();
+
+    if (upgrade === 'websocket') {
+      return ws(req, ctx);
+    }
+
+    return new Response('ok');
   }
 };
 
@@ -20,7 +27,10 @@ const hexToBytes = hex =>
   );
 
 const b64ToBytes = b64 => {
-  b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
+
+  b64 = b64
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
 
   while (b64.length % 4) {
     b64 += '=';
@@ -62,6 +72,7 @@ const addr = (t, b) =>
         : '';
 
 const parseAddr = (b, o, t) => {
+
   const l =
     t === 3
       ? b[o++]
@@ -83,6 +94,7 @@ const parseAddr = (b, o, t) => {
 };
 
 const vless = c => {
+
   if (!checkUUID(c)) {
     return null;
   }
@@ -121,8 +133,11 @@ const relay = async (
   send,
   close
 ) => {
+
   try {
+
     for (;;) {
+
       const {
         done,
         value
@@ -136,12 +151,16 @@ const relay = async (
         send(value);
       }
     }
+
   } catch (e) {
+
     console.log(
       'RELAY ERROR:',
       e?.message || e
     );
+
   } finally {
+
     try {
       rd.releaseLock();
     } catch {}
@@ -151,7 +170,9 @@ const relay = async (
 };
 
 const safeClose = (...a) => {
+
   for (const x of a) {
+
     try {
       x?.close?.();
     } catch {}
@@ -162,6 +183,7 @@ const dial = async (
   host,
   port
 ) => {
+
   console.log(
     'CONNECT:',
     host,
@@ -188,6 +210,9 @@ const ws = async (
   req,
   ctx
 ) => {
+
+  console.log('WS START');
+
   const pair = new WebSocketPair();
 
   const client = pair[0];
@@ -203,6 +228,7 @@ const ws = async (
   );
 
   const close = () => {
+
     console.log('CLOSE');
 
     safeClose(
@@ -212,13 +238,16 @@ const ws = async (
   };
 
   const send = d => {
+
     try {
       server.send(d);
     } catch {}
   };
 
   const process = async chunk => {
+
     try {
+
       console.log(
         'WS DATA:',
         chunk?.length
@@ -228,6 +257,7 @@ const ws = async (
         !chunk ||
         !chunk.length
       ) {
+
         console.log(
           'EMPTY DATA'
         );
@@ -242,6 +272,7 @@ const ws = async (
       const v = vless(chunk);
 
       if (!v) {
+
         console.log(
           'VLESS PARSE FAILED'
         );
@@ -280,11 +311,14 @@ const ws = async (
         );
 
       try {
+
         sock = await dial(
           host,
           port
         );
+
       } catch (e) {
+
         console.log(
           'CONNECT FAILED:',
           e?.message || e
@@ -300,6 +334,7 @@ const ws = async (
         payload &&
         payload.byteLength
       ) {
+
         await writer.write(
           payload
         );
@@ -312,6 +347,7 @@ const ws = async (
       );
 
     } catch (e) {
+
       console.log(
         'PROCESS ERROR:',
         e?.message || e
@@ -325,16 +361,19 @@ const ws = async (
     ed &&
     ed.length <= maxED
   ) {
+
     try {
+
       console.log(
         'EARLY DATA'
       );
 
-      process(
+      await process(
         b64ToBytes(ed)
       );
 
     } catch (e) {
+
       console.log(
         'EARLY DATA ERROR:',
         e?.message || e
@@ -345,13 +384,15 @@ const ws = async (
   server.addEventListener(
     'message',
     async e => {
+
       try {
+
         let data;
 
         if (
-          e.data instanceof
-          ArrayBuffer
+          e.data instanceof ArrayBuffer
         ) {
+
           data =
             new Uint8Array(
               e.data
@@ -360,6 +401,7 @@ const ws = async (
         } else if (
           e.data instanceof Blob
         ) {
+
           data =
             new Uint8Array(
               await e.data.arrayBuffer()
@@ -370,6 +412,7 @@ const ws = async (
             e.data
           )
         ) {
+
           data =
             new Uint8Array(
               e.data.buffer,
@@ -378,14 +421,15 @@ const ws = async (
             );
 
         } else if (
-          typeof e.data ===
-          'string'
+          typeof e.data === 'string'
         ) {
+
           data = enc(
             e.data
           );
 
         } else {
+
           console.log(
             'UNKNOWN WS TYPE'
           );
@@ -396,6 +440,7 @@ const ws = async (
         await process(data);
 
       } catch (e) {
+
         console.log(
           'MESSAGE ERROR:',
           e?.message || e
@@ -409,6 +454,7 @@ const ws = async (
   server.addEventListener(
     'close',
     () => {
+
       console.log(
         'WS CLOSED'
       );
@@ -420,6 +466,7 @@ const ws = async (
   server.addEventListener(
     'error',
     e => {
+
       console.log(
         'WS ERROR:',
         e?.message || e
@@ -431,6 +478,7 @@ const ws = async (
 
   ctx.waitUntil(
     new Promise(resolve => {
+
       server.addEventListener(
         'close',
         resolve
@@ -448,8 +496,7 @@ const ws = async (
     webSocket: client,
     headers: ed
       ? {
-          'sec-websocket-protocol':
-            ed
+          'sec-websocket-protocol': ed
         }
       : {}
   });
