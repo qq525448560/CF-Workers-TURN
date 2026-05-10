@@ -1,244 +1,375 @@
-import { connect } from 'cloudflare:sockets';
+import { connect } from 'cloudflare:sockets'
 
-const uuid = 'e258977b-e413-4718-a3af-02d75492c349';
-const maxED = 8192;
+const UUID = 'e258977b-e413-4718-a3af-02d75492c349'
 
-const hexToBytes = hex => {
-  const arr = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < arr.length; i++) {
-    arr[i] = parseInt(hex.substr(i * 2, 2), 16);
+/*
+  TURN TCP/TLS SERVER
+  推荐:
+  turns:your.turn.server:5349?transport=tcp
+
+  示例:
+  const TURN_HOST = '1.2.3.4'
+  const TURN_PORT = 5349
+*/
+
+const TURN_HOST = '47.83.122.49'
+const TURN_PORT = 3478
+const TURN_USER = ''
+const TURN_PASS = ''
+
+const textDecoder = new TextDecoder()
+const textEncoder = new TextEncoder()
+
+const MAGIC = new Uint8Array([0x21, 0x12, 0xA4, 0x42])
+
+const STUN = {
+  ALLOCATE_REQUEST: 0x0003,
+  ALLOCATE_RESPONSE: 0x0103,
+
+  SEND_INDICATION: 0x0016,
+  DATA_INDICATION: 0x0017,
+
+  CREATE_PERMISSION_REQUEST: 0x0008,
+
+  XOR_PEER_ADDRESS: 0x0012,
+  DATA: 0x0013,
+  USERNAME: 0x0006,
+  REALM: 0x0014,
+  NONCE: 0x0015,
+  TRANSPORT: 0x0019,
+  MESSAGE_INTEGRITY: 0x0008,
+  ERROR_CODE: 0x0009
+}
+
+function uuidToBytes(uuid) {
+  const hex = uuid.replace(/-/g, '')
+  const out = new Uint8Array(16)
+
+  for (let i = 0; i < 16; i++) {
+    out[i] = parseInt(hex.substr(i * 2, 2), 16)
   }
-  return arr;
-};
 
-const base64ToBytes = b64 => {
-  b64 = b64.replace(/-/g, '+').replace(/_/g, '/');
-  while (b64.length % 4) b64 += '=';
-  const bin = atob(b64);
-  return Uint8Array.from(bin, c => c.charCodeAt(0));
-};
+  return out
+}
+
+const UUID_BYTES = uuidToBytes(UUID)
+
+function concat(...arrs) {
+  const len = arrs.reduce((s, x) => s + x.length, 0)
+  const out = new Uint8Array(len)
+
+  let off = 0
+
+  for (const a of arrs) {
+    out.set(a, off)
+    off += a.length
+  }
+
+  return out
+}
+
+function u16(b, o = 0) {
+  return (b[o] << 8) | b[o + 1]
+}
+
+function randomTid() {
+  return crypto.getRandomValues(new Uint8Array(12))
+}
+
+function pad4(n) {
+  return (-n) & 3
+}
+
+function stunAttr(type, value) {
+  const out = new Uint8Array(4 + value.length + pad4(value.length))
+
+  const dv = new DataView(out.buffer)
+
+  dv.setUint16(0, type)
+  dv.setUint16(2, value.length)
+
+  out.set(value, 4)
+
+  return out
+}
+
+function stunMsg(type, attrs = []) {
+  const tid = randomTid()
+
+  const body = concat(...attrs)
+
+  const out = new Uint8Array(20)
+
+  const dv = new DataView(out.buffer)
+
+  dv.setUint16(0, type)
+  dv.setUint16(2, body.length)
+
+  out.set(MAGIC, 4)
+  out.set(tid, 8)
+
+  return concat(out, body)
+}
+
+function xorPeer(ip, port) {
+  const out = new Uint8Array(8)
+
+  out[1] = 1
+
+  const dv = new DataView(out.buffer)
+
+  dv.setUint16(2, port ^ 0x2112)
+
+  ip.split('.').forEach((v, i) => {
+    out[4 + i] = Number(v) ^ MAGIC[i]
+  })
+
+  return out
+}
+
+function parseStun(data) {
+  if (data.length < 20) return null
+
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength)
+
+  const type = dv.getUint16(0)
+  const len = dv.getUint16(2)
+
+  const attrs = {}
+
+  let off = 20
+
+  while (off + 4 <= 20 + len) {
+    const t = dv.getUint16(off)
+    const l = dv.getUint16(off + 2)
+
+    if (off + 4 + l > data.length) break
+
+    attrs[t] = data.slice(off + 4, off + 4 + l)
+
+    off += 4 + l + pad4(l)
+  }
+
+  return {
+    type,
+    attrs
+  }
+}
+
+function parseXorPeer(data) {
+  if (!data || data.length < 8) return null
+
+  const ip = MAGIC.map((m, i) => data[4 + i] ^ m).join('.')
+
+  const port = u16(data, 2) ^ 0x2112
+
+  return { ip, port }
+}
+
+function parseVLESS(chunk) {
+  if (chunk.length < 24) return null
+
+  for (let i = 0; i < 16; i++) {
+    if (chunk[i + 1] !== UUID_BYTES[i]) {
+      return null
+    }
+  }
+
+  const optLen = chunk[17]
+
+  const cmd = chunk[18 + optLen]
+
+  if (cmd !== 2) {
+    return null
+  }
+
+  const port = u16(chunk, 19 + optLen)
+
+  const atyp = chunk[21 + optLen]
+
+  let host = ''
+  let off = 22 + optLen
+
+  if (atyp === 1) {
+    host = [...chunk.slice(off, off + 4)].join('.')
+    off += 4
+  } else if (atyp === 2) {
+    const len = chunk[off]
+    off += 1
+
+    host = textDecoder.decode(chunk.slice(off, off + len))
+    off += len
+  } else {
+    return null
+  }
+
+  return {
+    host,
+    port,
+    data: chunk.slice(off)
+  }
+}
+
+function makeVLESSResp(data) {
+  return concat(
+    new Uint8Array([0, 0]),
+    data
+  )
+}
+
+async function readPacket(reader) {
+  const { done, value } = await reader.read()
+
+  if (done || !value) return null
+
+  return new Uint8Array(value)
+}
+
+async function createTurn() {
+  const socket = connect({
+    hostname: TURN_HOST,
+    port: TURN_PORT
+  })
+
+  await socket.opened
+
+  const writer = socket.writable.getWriter()
+  const reader = socket.readable.getReader()
+
+  const transport = new Uint8Array([17, 0, 0, 0])
+
+  const allocate = stunMsg(
+    STUN.ALLOCATE_REQUEST,
+    [
+      stunAttr(STUN.TRANSPORT, transport)
+    ]
+  )
+
+  await writer.write(allocate)
+
+  const pkt = await readPacket(reader)
+
+  if (!pkt) {
+    throw new Error('turn allocate fail')
+  }
+
+  return {
+    writer,
+    reader,
+    socket
+  }
+}
 
 export default {
   async fetch(req) {
-    try {
-      if (req.headers.get('Upgrade') !== 'websocket') {
-        return new Response('ok', { status: 200 });
-      }
-
-      return await ws(req);
-    } catch (e) {
-      return new Response(String(e), { status: 500 });
-    }
-  }
-};
-
-const idB = hexToBytes(uuid.replaceAll('-', ''));
-
-const dec = new TextDecoder();
-
-const u16 = (b, o = 0) => (b[o] << 8) | b[o + 1];
-
-const checkUUID = c => {
-  if (c.length < 17) return false;
-
-  for (let i = 0; i < idB.length; i++) {
-    if (c[i + 1] !== idB[i]) return false;
-  }
-
-  return true;
-};
-
-const addr = (t, b) =>
-  t === 3
-    ? dec.decode(b)
-    : t === 1
-    ? b.join('.')
-    : t === 4
-    ? `[${Array.from({ length: 8 }, (_, i) =>
-        u16(b, i * 2).toString(16)
-      ).join(':')}]`
-    : '';
-
-const parseAddr = (b, o, t) => {
-  const l =
-    t === 3
-      ? b[o++]
-      : t === 1
-      ? 4
-      : t === 4
-      ? 16
-      : 0;
-
-  return l && o + l <= b.length
-    ? {
-        addrBytes: b.subarray(o, o + l),
-        dataOffset: o + l
-      }
-    : null;
-};
-
-const vless = c => {
-  if (!checkUUID(c)) return null;
-
-  const o = 19 + c[17];
-
-  const t = c[o + 2] === 1 ? 1 : c[o + 2] + 1;
-
-  const a = parseAddr(c, o + 3, t);
-
-  return a
-    ? {
-        addrType: t,
-        ...a,
-        port: u16(c, o)
-      }
-    : null;
-};
-
-const relay = async (rd, send, close) => {
-  try {
-    for (;;) {
-      const { done, value } = await rd.read();
-
-      if (done) break;
-
-      if (value?.byteLength) send(value);
-    }
-  } catch {}
-
-  close();
-};
-
-const dial = async (h, p) => {
-  const s = connect({
-    hostname: h,
-    port: p
-  });
-
-  await s.opened;
-
-  return s;
-};
-
-const safeClose = (...a) =>
-  a.forEach(x => {
-    try {
-      x?.close?.();
-    } catch {}
-  });
-
-const ws = async req => {
-  const pair = new WebSocketPair();
-
-  const client = pair[0];
-  const server = pair[1];
-
-  server.accept();
-
-  let sock = null;
-  let writer = null;
-
-  const close = () => {
-    safeClose(sock, server);
-  };
-
-  const send = d => {
-    try {
-      server.send(d);
-    } catch {}
-  };
-
-  const process = async chunk => {
-    if (writer) {
-      await writer.write(chunk);
-      return;
+    if (req.headers.get('Upgrade') !== 'websocket') {
+      return new Response('ok')
     }
 
-    const v = vless(chunk);
+    const pair = new WebSocketPair()
 
-    if (!v) {
-      close();
-      return;
-    }
+    const client = pair[0]
+    const ws = pair[1]
 
-    send(new Uint8Array([chunk[0], 0]));
+    ws.accept()
 
-    const {
-      addrType,
-      addrBytes,
-      dataOffset,
-      port
-    } = v;
+    let turn = null
 
-    const host = addr(addrType, addrBytes);
-
-    if (!host) {
-      close();
-      return;
-    }
-
-    try {
-      sock = await dial(host, port);
-    } catch {
-      close();
-      return;
-    }
-
-    writer = sock.writable.getWriter();
-
-    const payload = chunk.subarray(dataOffset);
-
-    if (payload.byteLength) {
-      await writer.write(payload);
-    }
-
-    relay(
-      sock.readable.getReader(),
-      send,
-      close
-    );
-  };
-
-  try {
-    const ed = req.headers.get('sec-websocket-protocol');
-
-    if (ed?.length && ed.length <= maxED) {
+    const close = () => {
       try {
-        await process(base64ToBytes(ed));
+        turn?.socket?.close()
+      } catch {}
+
+      try {
+        ws.close()
       } catch {}
     }
 
-    server.addEventListener('message', async e => {
+    try {
+      turn = await createTurn()
+    } catch (e) {
+      return new Response(
+        'TURN CONNECT FAIL: ' + String(e),
+        { status: 500 }
+      )
+    }
+
+    ;(async () => {
       try {
-        let data;
+        while (true) {
+          const pkt = await readPacket(turn.reader)
 
-        if (e.data instanceof ArrayBuffer) {
-          data = new Uint8Array(e.data);
-        } else if (e.data?.buffer) {
-          data = new Uint8Array(e.data.buffer);
-        } else {
-          data = new Uint8Array(await e.data.arrayBuffer());
+          if (!pkt) break
+
+          const stun = parseStun(pkt)
+
+          if (!stun) continue
+
+          if (stun.type !== STUN.DATA_INDICATION) {
+            continue
+          }
+
+          const peer = parseXorPeer(
+            stun.attrs[STUN.XOR_PEER_ADDRESS]
+          )
+
+          const payload =
+            stun.attrs[STUN.DATA]
+
+          if (!peer || !payload) {
+            continue
+          }
+
+          ws.send(
+            makeVLESSResp(payload)
+          )
         }
-
-        await process(data);
       } catch {
-        close();
+        close()
       }
-    });
+    })()
 
-    server.addEventListener('close', close);
+    ws.addEventListener('message', async e => {
+      try {
+        const data = new Uint8Array(e.data)
 
-    server.addEventListener('error', close);
+        const v = parseVLESS(data)
+
+        if (!v) return
+
+        const peerAttr = stunAttr(
+          STUN.XOR_PEER_ADDRESS,
+          xorPeer(v.host, v.port)
+        )
+
+        const perm = stunMsg(
+          STUN.CREATE_PERMISSION_REQUEST,
+          [peerAttr]
+        )
+
+        await turn.writer.write(perm)
+
+        const send = stunMsg(
+          STUN.SEND_INDICATION,
+          [
+            peerAttr,
+            stunAttr(STUN.DATA, v.data)
+          ]
+        )
+
+        await turn.writer.write(send)
+      } catch {
+        close()
+      }
+    })
+
+    ws.addEventListener('close', close)
+
+    ws.addEventListener('error', close)
 
     return new Response(null, {
       status: 101,
       webSocket: client
-    });
-  } catch (e) {
-    close();
-
-    return new Response(String(e), {
-      status: 500
-    });
+    })
   }
-};
+}
