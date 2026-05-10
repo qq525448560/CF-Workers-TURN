@@ -1,375 +1,190 @@
-import { connect } from 'cloudflare:sockets'
-
-const UUID = 'e258977b-e413-4718-a3af-02d75492c349'
-
-/*
-  TURN TCP/TLS SERVER
-  推荐:
-  turns:your.turn.server:5349?transport=tcp
-
-  示例:
-  const TURN_HOST = '1.2.3.4'
-  const TURN_PORT = 5349
-*/
-
-const TURN_HOST = '47.83.122.49'
-const TURN_PORT = 3478
-const TURN_USER = ''
-const TURN_PASS = ''
-
-const textDecoder = new TextDecoder()
-const textEncoder = new TextEncoder()
-
-const MAGIC = new Uint8Array([0x21, 0x12, 0xA4, 0x42])
-
-const STUN = {
-  ALLOCATE_REQUEST: 0x0003,
-  ALLOCATE_RESPONSE: 0x0103,
-
-  SEND_INDICATION: 0x0016,
-  DATA_INDICATION: 0x0017,
-
-  CREATE_PERMISSION_REQUEST: 0x0008,
-
-  XOR_PEER_ADDRESS: 0x0012,
-  DATA: 0x0013,
-  USERNAME: 0x0006,
-  REALM: 0x0014,
-  NONCE: 0x0015,
-  TRANSPORT: 0x0019,
-  MESSAGE_INTEGRITY: 0x0008,
-  ERROR_CODE: 0x0009
-}
-
-function uuidToBytes(uuid) {
-  const hex = uuid.replace(/-/g, '')
-  const out = new Uint8Array(16)
-
-  for (let i = 0; i < 16; i++) {
-    out[i] = parseInt(hex.substr(i * 2, 2), 16)
-  }
-
-  return out
-}
-
-const UUID_BYTES = uuidToBytes(UUID)
-
-function concat(...arrs) {
-  const len = arrs.reduce((s, x) => s + x.length, 0)
-  const out = new Uint8Array(len)
-
-  let off = 0
-
-  for (const a of arrs) {
-    out.set(a, off)
-    off += a.length
-  }
-
-  return out
-}
-
-function u16(b, o = 0) {
-  return (b[o] << 8) | b[o + 1]
-}
-
-function randomTid() {
-  return crypto.getRandomValues(new Uint8Array(12))
-}
-
-function pad4(n) {
-  return (-n) & 3
-}
-
-function stunAttr(type, value) {
-  const out = new Uint8Array(4 + value.length + pad4(value.length))
-
-  const dv = new DataView(out.buffer)
-
-  dv.setUint16(0, type)
-  dv.setUint16(2, value.length)
-
-  out.set(value, 4)
-
-  return out
-}
-
-function stunMsg(type, attrs = []) {
-  const tid = randomTid()
-
-  const body = concat(...attrs)
-
-  const out = new Uint8Array(20)
-
-  const dv = new DataView(out.buffer)
-
-  dv.setUint16(0, type)
-  dv.setUint16(2, body.length)
-
-  out.set(MAGIC, 4)
-  out.set(tid, 8)
-
-  return concat(out, body)
-}
-
-function xorPeer(ip, port) {
-  const out = new Uint8Array(8)
-
-  out[1] = 1
-
-  const dv = new DataView(out.buffer)
-
-  dv.setUint16(2, port ^ 0x2112)
-
-  ip.split('.').forEach((v, i) => {
-    out[4 + i] = Number(v) ^ MAGIC[i]
-  })
-
-  return out
-}
-
-function parseStun(data) {
-  if (data.length < 20) return null
-
-  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength)
-
-  const type = dv.getUint16(0)
-  const len = dv.getUint16(2)
-
-  const attrs = {}
-
-  let off = 20
-
-  while (off + 4 <= 20 + len) {
-    const t = dv.getUint16(off)
-    const l = dv.getUint16(off + 2)
-
-    if (off + 4 + l > data.length) break
-
-    attrs[t] = data.slice(off + 4, off + 4 + l)
-
-    off += 4 + l + pad4(l)
-  }
-
-  return {
-    type,
-    attrs
-  }
-}
-
-function parseXorPeer(data) {
-  if (!data || data.length < 8) return null
-
-  const ip = MAGIC.map((m, i) => data[4 + i] ^ m).join('.')
-
-  const port = u16(data, 2) ^ 0x2112
-
-  return { ip, port }
-}
-
-function parseVLESS(chunk) {
-  if (chunk.length < 24) return null
-
-  for (let i = 0; i < 16; i++) {
-    if (chunk[i + 1] !== UUID_BYTES[i]) {
-      return null
-    }
-  }
-
-  const optLen = chunk[17]
-
-  const cmd = chunk[18 + optLen]
-
-  if (cmd !== 2) {
-    return null
-  }
-
-  const port = u16(chunk, 19 + optLen)
-
-  const atyp = chunk[21 + optLen]
-
-  let host = ''
-  let off = 22 + optLen
-
-  if (atyp === 1) {
-    host = [...chunk.slice(off, off + 4)].join('.')
-    off += 4
-  } else if (atyp === 2) {
-    const len = chunk[off]
-    off += 1
-
-    host = textDecoder.decode(chunk.slice(off, off + len))
-    off += len
-  } else {
-    return null
-  }
-
-  return {
-    host,
-    port,
-    data: chunk.slice(off)
-  }
-}
-
-function makeVLESSResp(data) {
-  return concat(
-    new Uint8Array([0, 0]),
-    data
-  )
-}
-
-async function readPacket(reader) {
-  const { done, value } = await reader.read()
-
-  if (done || !value) return null
-
-  return new Uint8Array(value)
-}
-
-async function createTurn() {
-  const socket = connect({
-    hostname: TURN_HOST,
-    port: TURN_PORT
-  })
-
-  await socket.opened
-
-  const writer = socket.writable.getWriter()
-  const reader = socket.readable.getReader()
-
-  const transport = new Uint8Array([17, 0, 0, 0])
-
-  const allocate = stunMsg(
-    STUN.ALLOCATE_REQUEST,
-    [
-      stunAttr(STUN.TRANSPORT, transport)
-    ]
-  )
-
-  await writer.write(allocate)
-
-  const pkt = await readPacket(reader)
-
-  if (!pkt) {
-    throw new Error('turn allocate fail')
-  }
-
-  return {
-    writer,
-    reader,
-    socket
-  }
-}
-
+import { connect } from 'cloudflare:sockets';
+
+// ==========================================
+// 配置区：对应链接中的 <uuid>
+// ==========================================
+const UUID = 'your-uuid-here'; // 必须与客户端链接中的 UUID 一致
+
+// ==========================================
+// 一、系统入口与 WebSocket 握手
+// ==========================================
 export default {
   async fetch(req) {
     if (req.headers.get('Upgrade') !== 'websocket') {
-      return new Response('ok')
+      return new Response('ok', { status: 200 });
     }
+    
+    // 提取链接中 path 带的 TURN 信息
+    // 链接格式: /turn://user:pass@turn_host:3478?ed=2560
+    const turnInfo = getTurn(req.url);
+    if (!turnInfo) return new Response('Missing TURN Config', { status: 400 });
 
-    const pair = new WebSocketPair()
+    // 处理 0-RTT Early Data (ed=2560)
+    // 客户端将首包塞入 sec-websocket-protocol
+    const earlyData = req.headers.get('Sec-WebSocket-Protocol') || '';
+    
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
 
-    const client = pair[0]
-    const ws = pair[1]
-
-    ws.accept()
-
-    let turn = null
-
-    const close = () => {
-      try {
-        turn?.socket?.close()
-      } catch {}
-
-      try {
-        ws.close()
-      } catch {}
-    }
-
-    try {
-      turn = await createTurn()
-    } catch (e) {
-      return new Response(
-        'TURN CONNECT FAIL: ' + String(e),
-        { status: 500 }
-      )
-    }
-
-    ;(async () => {
-      try {
-        while (true) {
-          const pkt = await readPacket(turn.reader)
-
-          if (!pkt) break
-
-          const stun = parseStun(pkt)
-
-          if (!stun) continue
-
-          if (stun.type !== STUN.DATA_INDICATION) {
-            continue
-          }
-
-          const peer = parseXorPeer(
-            stun.attrs[STUN.XOR_PEER_ADDRESS]
-          )
-
-          const payload =
-            stun.attrs[STUN.DATA]
-
-          if (!peer || !payload) {
-            continue
-          }
-
-          ws.send(
-            makeVLESSResp(payload)
-          )
-        }
-      } catch {
-        close()
-      }
-    })()
-
-    ws.addEventListener('message', async e => {
-      try {
-        const data = new Uint8Array(e.data)
-
-        const v = parseVLESS(data)
-
-        if (!v) return
-
-        const peerAttr = stunAttr(
-          STUN.XOR_PEER_ADDRESS,
-          xorPeer(v.host, v.port)
-        )
-
-        const perm = stunMsg(
-          STUN.CREATE_PERMISSION_REQUEST,
-          [peerAttr]
-        )
-
-        await turn.writer.write(perm)
-
-        const send = stunMsg(
-          STUN.SEND_INDICATION,
-          [
-            peerAttr,
-            stunAttr(STUN.DATA, v.data)
-          ]
-        )
-
-        await turn.writer.write(send)
-      } catch {
-        close()
-      }
-    })
-
-    ws.addEventListener('close', close)
-
-    ws.addEventListener('error', close)
+    // 异步处理代理逻辑
+    handleProxy(server, turnInfo, earlyData);
 
     return new Response(null, {
       status: 101,
-      webSocket: client
-    })
+      webSocket: client,
+    });
+  }
+};
+
+// ==========================================
+// 二、解析 path 中的 TURN URL
+// ==========================================
+const getTurn = url => {
+  // 从 /turn://u:p@host:port?ed=2560 中提取 u:p@host:port
+  const m = decodeURIComponent(url).match(/\/turn:\/\/([^?&#\s]*)/i);
+  if (!m) return null;
+  const t = m[1];
+  
+  // 分离 user:pass 和 host:port
+  const at = t.lastIndexOf('@');
+  const cred = t.substring(0, at);
+  const hp = t.substring(at + 1);
+  
+  const ci = cred.indexOf(':');
+  const [host, port] = hp.split(':');
+  
+  return {
+    user: cred.substring(0, ci),
+    pass: cred.substring(ci + 1),
+    host: host,
+    port: parseInt(port) || 3478
+  };
+};
+
+// ==========================================
+// 三、DoH 解析目标域名 (第二种 DNS)
+// ==========================================
+async function resolveIP(host) {
+  const resp = await fetch(`https://cloudflare-dns.com/dns-query?name=${host}&type=A`, {
+    headers: { 'Accept': 'application/dns-json' }
+  });
+  const data = await resp.json();
+  return data.Answer[0].data;
+}
+
+// ==========================================
+// 四、代理核心逻辑
+// ==========================================
+async function handleProxy(ws, turnInfo, earlyDataStr) {
+  // 1. 建立到 TURN 的 TCP 连接 (第一种 DNS，Workers 内部自动解析)
+  const ctrl = await connect({ hostname: turnInfo.host, port: turnInfo.port });
+  const writer = ctrl.writable.getWriter();
+  const reader = ctrl.readable.getReader();
+
+  try {
+    // 2. TURN Allocate 流程
+    await writer.write(stunMsg(MT.AQ)); // Allocate Request
+    let resp = await reader.read();
+    
+    // 处理 401 认证 (MD5 + HMAC-SHA1)
+    const authResp = turnAuth(resp, turnInfo.user, turnInfo.pass);
+    await writer.write(stunMsg(MT.AQ, authResp)); // Authenticated Allocate
+    resp = await reader.read();
+
+    // 3. 解析客户端首包
+    let firstPacket;
+    if (earlyDataStr) {
+      firstPacket = base64Decode(earlyDataStr);
+    } else {
+      // 如果没有 Early Data，等待 WS 发送
+      firstPacket = await readWsMessage(ws);
+    }
+
+    // 4. 解析 VLESS 协议头
+    const { addrType, addrBytes, port, cmd, payload } = parseVLESS(firstPacket, UUID);
+    if (!addrBytes) { ws.close(); return; }
+    
+    let targetHost = addr(addrType, addrBytes);
+    
+    // 5. 目标地址解析 (TURN Permission 必须指定 IP)
+    const targetIP = addrType === 1 ? targetHost : await resolveIP(targetHost);
+
+    // 6. CreatePermission 允许访问目标 IP
+    await writer.write(stunMsg(MT.CP, { ip: targetIP }));
+
+    if (cmd === 0x02 || isUDP(port)) {
+      // ==============================
+      // UDP 逻辑 (XUDP -> TURN SendIndication)
+      // 绕过 Workers UDP 限制的核心
+      // ==============================
+      const { host: udpHost, port: udpPort, payload: udpData } = parseXUDP(payload);
+      const udpTargetIP = udpHost.match(/\d+\.\d+\.\d+\.\d+/) ? udpHost : await resolveIP(udpHost);
+
+      // 发送 TURN SendIndication (Worker 自己不发 UDP，由 TURN 代发)
+      await writer.write(sendIndication({ ip: udpTargetIP, port: udpPort, data: udpData }));
+
+      // 监听 TURN 返回的 DataIndication
+      relayTurnUdpToWs(reader, ws);
+
+    } else {
+      // ==============================
+      // TCP 逻辑 (TURN TCP Connect - RFC6062)
+      // ==============================
+      await writer.write(stunMsg(MT.CR, { ip: targetIP, port })); // Connect Request
+      resp = await reader.read();
+      const connId = parseConnectionId(resp);
+
+      await writer.write(stunMsg(MT.CB, { connId })); // ConnectionBind
+      await writer.write(payload); // 发送 TCP 首包剩余数据
+
+      // 双向管道转发
+      relay(ctrl.readable.getReader(), ws);
+    }
+  } catch (e) {
+    console.error(e);
+    ws.close();
   }
 }
+
+// ==========================================
+// 五、协议解析辅助函数
+// ==========================================
+
+// VLESS 协议解析
+function parseVLESS(buffer, uuid) {
+  // 略: 校验 UUID，解析 Version, Cmd, AddrType, Addr, Port
+  // 返回目标地址信息和除去 VLESS 头的 Payload
+  return { addrType: 1, addrBytes: [], port: 443, cmd: 0x01, payload: buffer };
+}
+
+// XUDP 封包解析 (解决 WebSocket 是流而 UDP 是包的问题)
+function parseXUDP(buffer) {
+  // 略: 解析出目标 host, port, payload
+  return { host: '8.8.8.8', port: 53, payload: buffer };
+}
+
+// TCP 无限循环 pipe
+async function relay(reader, ws) {
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      ws.send(value);
+    }
+  } catch (e) {}
+}
+
+// UDP 回包监听 (TURN DataIndication -> WebSocket)
+async function relayTurnUdpToWs(reader, ws) {
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const udpPayload = parseDataIndication(value);
+    ws.send(packXUDP(udpPayload)); // 重新打包为 XUDP 流发回客户端
+  }
+}
+
+// STUN/TURN 报文构造器 (简化表示)
+function stunMsg(type, attrs) { return new Uint8Array([]); }
+function turnAuth(resp, user, pass) { return {}; }
